@@ -1,0 +1,15 @@
+# Audio I/O
+sounddevice>=0.4.6
+numpy>=1.26.0
+
+# Speech-to-text (runs locally)
+faster-whisper>=1.0.0
+
+# LLM
+openai>=1.0.0
+
+# Text-to-speech (HTTP streaming)
+aiohttp>=3.9.0
+
+# Environment configuration
+python-dotenv>=1.0.0
