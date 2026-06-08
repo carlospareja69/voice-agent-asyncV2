@@ -128,6 +128,19 @@ This solution improves correctness and maintainability while avoiding unnecessar
 
 ---
 
+## Implementation Status (updated post Issue #8)
+
+**Fix async iterator interface contracts** — ✅ Completed in Issue #5.
+`LLMProvider.generate()` and `TTSProvider.synthesize()` were corrected from `async def` to `def` in their ABCs. The concrete implementations (`OpenAILLM`, `ElevenLabsTTS`) remain `async def` generator functions — the correct pattern. See handoffs.md for the full rationale.
+
+**Introduce shared typed message structures** — ⏸ Deferred. Accepted technical debt.
+`ContextManager` and `LLMProvider.generate()` still use `list[dict]` at the message boundary. A `Message` TypedDict was discussed but not implemented. This remains on the backlog for a post-Issue #9 hardening pass. In the meantime, the pipeline only passes `"user"` and `"assistant"` role strings, so the untyped boundary is safe in practice.
+
+**Postpone advanced lifecycle abstractions** — ✅ Remains deferred.
+`ElevenLabsTTS` uses session-per-request (no `close()` method). No provider lifecycle protocol was added. This is appropriate for the current single-conversation architecture.
+
+---
+
 ## Architectural Lessons
 
 This checkpoint demonstrated the importance of:

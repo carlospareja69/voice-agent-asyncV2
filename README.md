@@ -22,7 +22,7 @@ MicrophoneInput
     STT stage
       ↓  text_queue   (str)
     LLM stage
-      ↓  token_queue  (str)
+      ↓  token_queue  (str | None)
     TTS stage
       ↓  tts_queue    (bytes)
 SpeakerOutput

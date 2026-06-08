@@ -39,8 +39,9 @@ class ElevenLabsTTS(TTSProvider):
         - Channels : 1 (mono)
 
     Downstream consumers must be configured to match this format.
-    ``SpeakerOutput`` (Issue #7) must open its ``sounddevice.OutputStream``
-    with ``dtype="int16"``, ``samplerate=24000``, ``channels=1``.
+    ``SpeakerOutput`` derives its ``samplerate`` from ``Settings.tts_sample_rate``
+    (wired in ``Pipeline.__init__``), so the two ends stay in sync automatically
+    when ``TTS_SAMPLE_RATE`` is changed via the environment.
     ``tts_queue`` items can be reconstructed as a numpy array with::
 
         np.frombuffer(chunk, dtype=np.int16)

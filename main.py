@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 
 def build_pipeline(settings: Settings) -> Pipeline:
-    stt = WhisperSTT(model_name=settings.whisper_model)
+    stt = WhisperSTT(model_name=settings.whisper_model, sample_rate=settings.audio_sample_rate)
     llm = OpenAILLM(api_key=settings.openai_api_key, model=settings.llm_model)
     tts = ElevenLabsTTS(
         api_key=settings.elevenlabs_api_key,

@@ -1,4 +1,4 @@
-# Sprint Handoff — Post Issue #8
+# Sprint Handoff — Post Issue #8 (+ pre-Issue #9 consistency cleanup)
 
 ---
 
@@ -32,7 +32,7 @@
 | `agent/llm/openai.py` | ✅ Fully implemented |
 | `agent/tts/elevenlabs.py` | ✅ Fully implemented |
 | `agent/pipeline.py` | ✅ Fully implemented in Issue #8 |
-| `main.py` | ✅ Entry point wired — `ElevenLabsTTS` receives `output_format` from Settings |
+| `main.py` | ✅ Entry point wired — `ElevenLabsTTS` receives `output_format` from Settings; `WhisperSTT` receives `sample_rate` from Settings |
 | `.env.example` | ✅ `TTS_SAMPLE_RATE` documented |
 | `tests/test_settings.py` | ✅ 22 tests passing |
 | `tests/test_audio_input.py` | ✅ 9 tests passing |
@@ -300,7 +300,7 @@ Deferred past Issue #9. The pipeline only passes `"user"` or `"assistant"` so co
 
 ### 🟡 Low — `WhisperSTT.sample_rate` unused field
 
-`__init__` accepts and stores `sample_rate`, but `_sync_transcribe` never passes it to `model.transcribe()`. faster-whisper always assumes 16 kHz input. A caller passing `sample_rate=8000` gets no error, just degraded quality. Address in a future hardening pass (Option A: warning; B: remove; C: doc-only).
+`__init__` accepts and stores `sample_rate` (now correctly wired from `settings.audio_sample_rate` in `main.py`), but `_sync_transcribe` never passes it to `model.transcribe()`. faster-whisper always assumes 16 kHz input. A caller passing `sample_rate=8000` gets no error, just degraded quality. Address in a future hardening pass (Option A: warning; B: remove; C: doc-only).
 
 ---
 
