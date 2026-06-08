@@ -134,10 +134,10 @@ This project follows a **HITL (Human-in-the-Loop)** incremental model:
 
 ## Roadmap
 
-- [ ] #1 — Initialize project skeleton and dependencies
-- [ ] #2 — Settings module with env validation
-- [ ] #3 — Async microphone input (`sounddevice`)
-- [ ] #4 — Whisper STT provider (`faster-whisper`)
+- [x] #1 — Initialize project skeleton and dependencies
+- [x] #2 — Settings module with env validation
+- [x] #3 — Async microphone input (`sounddevice`)
+- [x] #4 — Whisper STT provider (`faster-whisper`)
 - [ ] #5 — OpenAI streaming LLM provider
 - [ ] #6 — ElevenLabs streaming TTS provider
 - [ ] #7 — Async speaker output (`sounddevice`)

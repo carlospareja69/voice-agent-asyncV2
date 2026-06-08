@@ -1,4 +1,4 @@
-# Sprint Handoff — Post Issue #3
+# Sprint Handoff — Post Issue #4
 
 ---
 
@@ -9,6 +9,7 @@
 | #1 | Initialize project skeleton and dependencies | ✅ Done |
 | #2 | Settings module with env validation | ✅ Done |
 | #3 | Async microphone input with sounddevice | ✅ Done |
+| #4 | Whisper STT provider | ✅ Done |
 
 ---
 
@@ -22,16 +23,17 @@
 | `agent/llm/base.py` | ✅ ABC defined — ⚠️ broken signature (see Warnings) |
 | `agent/tts/base.py` | ✅ ABC defined — ⚠️ broken signature (see Warnings) |
 | `agent/audio/input.py` | ✅ Fully implemented |
+| `agent/stt/whisper.py` | ✅ Fully implemented |
 | `agent/audio/output.py` | 🔶 Scaffold — `stream()` raises `NotImplementedError` |
-| `agent/stt/whisper.py` | 🔶 Scaffold — `transcribe()` raises `NotImplementedError` |
 | `agent/llm/openai.py` | 🔶 Scaffold — `generate()` raises `NotImplementedError` |
 | `agent/tts/elevenlabs.py` | 🔶 Scaffold — `synthesize()` raises `NotImplementedError` |
 | `agent/pipeline.py` | 🔶 Scaffold — all methods raise `NotImplementedError` |
 | `main.py` | ✅ Entry point wired — fails at runtime until Issue #8 |
 | `tests/test_settings.py` | ✅ 19 tests passing |
 | `tests/test_audio_input.py` | ✅ 9 tests passing |
+| `tests/test_stt_whisper.py` | ✅ 13 tests passing |
 
-**Total test count: 28 — all passing.**
+**Total test count: 41 — all passing.**
 
 ---
 
@@ -51,12 +53,11 @@ These are settled. Do not change without an explicit architectural discussion.
 - STT stage reconstructs with: `np.frombuffer(chunk, dtype=np.float32)`
 - This is the single authoritative description of `audio_queue` items
 
-### Threading model (established by Issue #3)
-- sounddevice callbacks fire on a PortAudio background thread — not the event loop thread
-- The only safe bridge is: `loop.call_soon_threadsafe(queue.put_nowait, data)`
-- `loop` must be captured via `asyncio.get_running_loop()` **before** the callback is defined, on the event loop thread
-- `indata.tobytes()` must be called inside the callback to create an independent bytes copy before the PortAudio buffer is reused
-- This exact pattern will be **mirrored by Issue #7 (SpeakerOutput)**
+### Threading model (established by Issue #3, confirmed by Issue #4)
+- sounddevice callbacks fire on PortAudio's thread — bridge via `loop.call_soon_threadsafe()`
+- CPU-bound synchronous work (Whisper inference) runs via `loop.run_in_executor(None, fn)`
+- `loop` must be captured via `asyncio.get_running_loop()` before entering any background thread context
+- Lazy generators returned by synchronous libraries (e.g., `model.transcribe()`) must be **fully consumed inside the executor callable** — never returned to the event loop for iteration
 
 ### Provider pattern
 - STT, LLM, and TTS implement ABCs from `base.py` — one abstract method each
@@ -65,7 +66,12 @@ These are settled. Do not change without an explicit architectural discussion.
 ### Cancellation contract
 - Every stage coroutine must re-raise `CancelledError` after any local cleanup
 - Never swallow `CancelledError` — the pipeline task group depends on seeing it
-- Catch `asyncio.CancelledError` specifically, not `Exception` (CancelledError is BaseException in Python 3.8+)
+- Catch `asyncio.CancelledError` specifically, not `Exception` (it is `BaseException` in Python 3.8+)
+
+### Model loading contract (established by Issue #4)
+- Expensive synchronous initialization (model weight loading) belongs in `__init__`
+- `__init__` runs in `build_pipeline()`, which is called before `asyncio.run()`
+- The event loop must never pay model loading costs
 
 ### Configuration contract
 - `Settings.from_env()` is the only valid production constructor
@@ -81,30 +87,37 @@ asyncio.run(pipeline.run()) # async — event loop starts here
 
 ---
 
-## QA Seam Findings (Issue #3 Review)
+## QA Seam Findings
 
-### Accepted risks (no action required now)
+### Issue #3 — Accepted risks
 
 | Risk | Reason accepted |
 |---|---|
 | Post-cancellation callback fires in the shutdown window | Benign — InputStream `__exit__` is synchronous and stops PortAudio before `asyncio.run()` unwinds. At most one extra chunk in the queue. |
 | `logging` call inside audio callback acquires a lock on audio thread | Correct per Python logging docs; only fires on abnormal status events — not on every chunk |
 
-### Deferred to future issues
+### Issue #4 — Accepted risks
+
+| Risk | Reason accepted |
+|---|---|
+| `np.frombuffer` returns a read-only array passed to faster-whisper | Works today; faster-whisper reads but never writes the input array. If a future version writes to it, the crash is a clear `ValueError: assignment destination is read-only`. Low probability; fix with `.copy()` if it surfaces. |
+| `model.transcribe()` exception types not documented or tested | Correct to let exceptions propagate. Issue #8 must decide whether the STT stage catches and continues or shuts down. |
+
+### Deferred to future issues (both issues)
 
 | Item | Deferred to |
 |---|---|
-| `QueueFull` exception silently discarded if `queue.maxsize` is ever set | Issue #8 — queue overflow design must be done when `maxsize` is introduced, not independently |
-| `PortAudioError` (no input device) path untested | Issue #9 smoke test or integration hardening |
-| `sleep(0.05)` in tests is over-conservative; `sleep(0)` would suffice | Cosmetic — safe to leave |
+| `QueueFull` exception silently discarded if `queue.maxsize` is set | Issue #8 — must be designed together with maxsize introduction |
+| `PortAudioError` (no input device) path untested | Issue #9 smoke test or hardening |
+| `beam_size=5` hardcoded, not configurable | Future performance-tuning issue |
 
 ---
 
 ## Known Architectural Risks (Pre-Implementation)
 
-These were identified in the mid-sprint architectural review. They are **not yet fixed** and affect Issues #4–#8.
+These were identified in the mid-sprint architectural review. They affect Issues #5–#8.
 
-### 🔴 Critical — fix before implementing Issues #5 and #6
+### 🔴 Critical — fix before starting Issues #5 or #6
 
 **`agent/llm/base.py` and `agent/tts/base.py` have a broken return type.**
 
@@ -114,41 +127,46 @@ async def generate(self, messages: list[dict]) -> AsyncIterator[str]: ...
 async def synthesize(self, text: str) -> AsyncIterator[bytes]: ...
 ```
 
-An `async def` that returns `AsyncIterator` is a coroutine. A coroutine must be `await`ed to get the iterator. But the natural implementation of `generate()` and `synthesize()` is an async generator (with `yield`), which **is itself** the async iterator — callers use `async for token in provider.generate(messages)` directly.  
+An `async def` that returns `AsyncIterator` is a coroutine. The natural implementation is an async generator (with `yield`), which **is itself** the async iterator — callers use `async for token in provider.generate(messages)` directly, no `await`. These two calling conventions are mutually exclusive.
 
-These two calling conventions are mutually exclusive. The fix is one word: change `async def` to `def`. The concrete implementations remain `async def` with `yield` — they become async generators, which satisfy `AsyncIterator` as their return type.
+Fix: change `async def` to `def` on both abstract methods. One word per file.
 
-**Fix this before writing any code in Issues #5 or #6.**
+**This must happen before writing any code in Issues #5 or #6.**
 
 ### 🟡 High — design decision required before Issue #8
 
 **Missing sentence assembler stage between LLM and TTS.**
 
-`token_queue` currently carries individual LLM tokens (single words/subwords). TTS providers need sentence-level or phrase-level input to produce natural audio. Feeding individual tokens produces one HTTP request per word with no prosody.
+`token_queue` carries individual LLM tokens. TTS providers need sentence-level input for natural audio. Issue #8 must either add a sentence assembler task or change the LLM stage to enqueue full sentences.
 
-Issue #8 must either:
-- Add a sentence assembler task between `token_queue` and the TTS stage, or
-- Change `token_queue` to carry full sentences (assembled in the LLM stage before enqueuing)
+### 🟡 High — address before Issue #8
 
-**Decide the approach when starting Issue #8 — not before.**
+**`WhisperSTT.sample_rate` is stored but never used.**
+
+`__init__` accepts `sample_rate` and stores it, but `_sync_transcribe` never passes it to `model.transcribe()`. faster-whisper always assumes 16 kHz input. A caller passing `sample_rate=8000` gets no error, just degraded transcription quality. This creates a false constructor contract.
+
+Fix before Issue #8 (where the STT stage loop is written and the call is embedded):
+- Option A: add `if self.sample_rate != 16000: logger.warning(...)` to signal misuse
+- Option B: remove the `sample_rate` parameter entirely (simplest)
+- Option C: document explicitly in the docstring that the value is informational only
 
 ### 🟠 Medium — clean up in a single pass
 
 **`ContextManager` has no role validation and unbounded message growth.**
 
-- `add_turn(role, content)` accepts any string as `role` — invalid roles fail later at the OpenAI API with an opaque HTTP 400
-- `_messages` grows forever — after ~20 minutes of conversation the context window will overflow
+- `add_turn(role, content)` accepts any string as `role`
+- `_messages` grows forever — context window overflow after extended conversations
 - No `TypedDict` for messages — `list[dict]` is untyped at the API boundary
 
-**Address when implementing Issue #5 (OpenAI LLM), since that's when the context boundary becomes concrete.**
+**Address when implementing Issue #5 (OpenAI LLM).**
 
 ### 🟠 Medium — duplicate defaults maintenance trap
 
-`MicrophoneInput.__init__` has `sample_rate=16000, chunk_size=1024` as defaults.  
-`Settings` also has `audio_sample_rate=16000, audio_chunk_size=1024` as defaults.  
+`MicrophoneInput.__init__` has `sample_rate=16000, chunk_size=1024` as defaults.
+`Settings` also has `audio_sample_rate=16000, audio_chunk_size=1024` as defaults.
 `SpeakerOutput.__init__` hardcodes `sample_rate=24000` (not from Settings at all).
 
-These are maintained separately. Fix both audio modules when implementing Issue #7, in a single pass.
+Fix both audio modules in a single pass when implementing Issue #7.
 
 ---
 
@@ -156,15 +174,14 @@ These are maintained separately. Fix both audio modules when implementing Issue 
 
 | # | Title | Depends on | Key file |
 |---|---|---|---|
-| #4 | Whisper STT provider | #3 ✅ (audio format now confirmed) | `agent/stt/whisper.py` |
-| #5 | OpenAI streaming LLM provider | — | `agent/llm/openai.py` |
-| #6 | ElevenLabs streaming TTS provider | — | `agent/tts/elevenlabs.py` |
+| #5 | OpenAI streaming LLM provider | ABC fix (🔴 Critical above) | `agent/llm/openai.py` |
+| #6 | ElevenLabs streaming TTS provider | ABC fix (🔴 Critical above) | `agent/tts/elevenlabs.py` |
 | #7 | Async speaker output | — | `agent/audio/output.py` |
-| #8 | Wire all pipeline stages | #4–#7 | `agent/pipeline.py` |
+| #8 | Wire all pipeline stages | #5, #6, #7 | `agent/pipeline.py` |
 | #9 | End-to-end smoke test | #8 | manual + `tests/` |
 
-Issues #4, #5, #6, #7 are **independent** — can be implemented in any order.  
-Issue #8 requires all four to be complete.
+Issues #5, #6, #7 are independent of each other. Issues #5 and #6 both require the ABC fix first.  
+Issue #8 requires all three to be complete.
 
 ---
 
@@ -172,55 +189,59 @@ Issue #8 requires all four to be complete.
 
 | Item | Deferred until |
 |---|---|
-| Voice Activity Detection (VAD) | After Issue #9 — mic captures continuously; silence hits STT and produces empty strings that propagate to LLM |
-| `asyncio.Queue(maxsize=N)` back-pressure | Issue #8 hardening — must be designed together with `QueueFull` error handling in the audio callback |
+| Voice Activity Detection (VAD) | After Issue #9 — silence hits STT producing empty strings that propagate to LLM |
+| `asyncio.Queue(maxsize=N)` back-pressure | Issue #8 hardening — must be designed together with `QueueFull` error handling |
 | `aiohttp.ClientSession` lifecycle in ElevenLabsTTS | Issues #6 (open) + #8 (close on shutdown) |
 | `ContextManager` role validation and sliding window | Issue #5 |
 | `Message` TypedDict to replace `list[dict]` | Issue #5 — same pass as ContextManager fixes |
-| `async def → def` fix on LLM and TTS ABCs | Before Issue #5 or #6 begins (critical) |
+| `async def → def` fix on LLM and TTS ABCs | Prerequisite before Issue #5 or #6 begins |
+| `WhisperSTT.sample_rate` unused field | Before Issue #8 — see options under Known Risks above |
+| `beam_size` hardcoded in `_sync_transcribe` | Future performance-tuning issue |
+| `np.frombuffer` read-only array in Whisper | Add `.copy()` if faster-whisper write errors surface |
+| Chunk accumulation before STT | Issue #8 — pipeline stage must collect enough audio before calling `transcribe()` |
 
 ---
 
 ## Recommended Next Issue
 
-**→ Issue #4: Whisper STT provider** (`agent/stt/whisper.py`)
+**→ Fix LLM and TTS ABC signatures (prerequisite micro-task), then Issue #7.**
 
-**Why now:**
-- Issue #3 is complete — the audio format is confirmed (`float32`, `chunk_size` frames, mono, bytes)
-- Issue #4 was explicitly marked as depending on #3 to know the audio shape before encoding assumptions
-- `faster-whisper` is CPU-bound and synchronous — it establishes the `run_in_executor` pattern for blocking inference that no other issue has introduced yet
-- Self-contained: no dependency on LLM or TTS
+**The ABC fix first:**
+Two one-line changes — `async def generate` → `def generate` and `async def synthesize` → `def synthesize`. These are blocking prerequisites for Issues #5 and #6. Do them as a single small commit before any other issue starts.
 
-**Key implementation notes for Issue #4:**
+**Then Issue #7: Async speaker output** (`agent/audio/output.py`)
 
-```python
-# Reconstruct the numpy array from bytes — confirmed format from Issue #3
-audio = np.frombuffer(chunk, dtype=np.float32)
+**Why #7 before #5 or #6:**
+- No ABC fix dependency — `SpeakerOutput` has no ABC
+- Mirrors Issue #3 (microphone input) exactly: callback-based sounddevice, `call_soon_threadsafe`, `CancelledError` re-raise, executor-free
+- Establishes the full audio path (input ✅ → STT ✅ → ... → speaker 🔶) from the edges inward
+- After #7, Issues #5 and #6 can be implemented in either order with the complete audio frame in place
 
-# faster-whisper is synchronous — must run in executor to avoid blocking the loop
-loop = asyncio.get_running_loop()
-segments, _ = await loop.run_in_executor(None, model.transcribe, audio)
-transcript = " ".join(seg.text for seg in segments).strip()
-```
+**Key implementation notes for Issue #7:**
 
-- Use `asyncio.get_running_loop().run_in_executor(None, ...)` — same loop-capture pattern as Issue #3
-- Load the `WhisperModel` once in `__init__`, not per transcription call
-- Return empty string `""` for silent/empty transcriptions — the pipeline stage must filter these before sending to LLM
-- `device="cpu"` and `compute_type="int8"` are safe defaults; expose them via constructor if needed
-- Verify `faster-whisper` wheel availability on Python 3.14 before starting (flagged in handoffs)
+- `SpeakerOutput` is the inverse of `MicrophoneInput`: reads from a queue, writes to the device
+- Use `sounddevice.OutputStream` with a callback — callback runs on PortAudio's thread
+- The callback reads from the queue; use a synchronous bridge (a `queue.Queue`, not `asyncio.Queue`) internally, or read directly in a loop with `asyncio.Queue.get_nowait()` inside the callback
+  - ⚠️ **Important design choice**: sounddevice output callbacks are time-critical (must return before the next buffer deadline). Using `asyncio.Queue` across a thread boundary here is the inverse of Issue #3 — the audio thread needs to *pull* from the queue, not push to it. A `queue.Queue` (threading-safe) as an internal buffer, fed by the asyncio task, is the cleaner pattern
+- Fix `sample_rate=24000` hardcoding — read from `Settings.audio_sample_rate` or add a dedicated `Settings.tts_sample_rate` field
+- Re-raise `CancelledError` after closing the stream
 
 ---
 
 ## Warnings — Future Implementations Must Respect
 
-1. **Fix `async def → def` on `LLMProvider.generate()` and `TTSProvider.synthesize()` before writing any code in Issues #5 or #6.** The current signatures are a calling-convention mismatch that will cause a confusing runtime error.
+1. **Fix `async def → def` on `LLMProvider.generate()` and `TTSProvider.synthesize()` before writing any code in Issues #5 or #6.** The current signatures are a calling-convention mismatch.
 
 2. **Every stage task must re-raise `CancelledError`.** `asyncio.gather()` in `pipeline.run()` will not detect shutdown if any stage swallows it.
 
-3. **Blocking inference and I/O must go through `run_in_executor`.** Direct synchronous calls inside `async def` block the entire event loop, freezing all other stages. Whisper inference is the first real test of this constraint.
+3. **Blocking inference and I/O must go through `run_in_executor`.** Direct synchronous calls inside `async def` block the entire event loop. Whisper demonstrates this correctly — it is the reference pattern.
 
-4. **The `audio_queue` format is fixed.** `float32`, mono, `chunk_size` frames, raw bytes. The STT stage must reconstruct with `np.frombuffer(chunk, dtype=np.float32)`. Changing this requires updating both `input.py` and `whisper.py` in the same PR.
+4. **Lazy generators from synchronous libraries must be consumed inside the executor callable.** Never return a generator to the event loop for iteration. `_sync_transcribe` demonstrates this correctly.
 
-5. **`MicrophoneInput` and `SpeakerOutput` have duplicate default values vs `Settings`.** Always pass `settings.audio_sample_rate` and `settings.audio_chunk_size` explicitly from `pipeline.py`. Do not rely on the constructor defaults.
+5. **The `audio_queue` format is fixed.** `float32`, mono, `chunk_size` frames, raw bytes. STT stage reconstructs with `np.frombuffer(chunk, dtype=np.float32)`. Changing this requires updating both `input.py` and `whisper.py` in the same commit.
 
-6. **`ContextManager.add_turn()` does not validate the `role` argument.** Until fixed in Issue #5, only pass `"user"` or `"assistant"` — no other strings.
+6. **`ContextManager.add_turn()` does not validate the `role` argument.** Until fixed in Issue #5, only pass `"user"` or `"assistant"`.
+
+7. **`WhisperSTT.sample_rate` is stored but unused.** Do not pass values other than 16000 — they produce no error but degrade transcription quality silently.
+
+8. **Chunk accumulation is a pipeline responsibility (Issue #8).** `WhisperSTT.transcribe()` accepts any-length bytes, but 64 ms chunks (1024 frames at 16 kHz) produce poor results. The STT stage loop must accumulate enough audio before calling `transcribe()`.
