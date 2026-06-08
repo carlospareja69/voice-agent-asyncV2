@@ -111,7 +111,7 @@ python main.py
 
 | Module | Responsibility |
 |---|---|
-| `agent/pipeline.py` | Owns all queues, starts all stage tasks, handles shutdown |
+| `agent/pipeline.py` | Orchestrates all stages: STT accumulation, LLM streaming with context, inline sentence assembly, TTS synthesis, clean cancellation |
 | `agent/audio/input.py` | Captures mic audio, pushes raw PCM bytes to `audio_queue` |
 | `agent/audio/output.py` | Reads from `tts_queue`, plays audio through speaker via `sounddevice.OutputStream` |
 | `agent/stt/base.py` | `STTProvider` ABC — `async transcribe(audio) -> str` |
@@ -189,7 +189,7 @@ This project follows a **HITL (Human-in-the-Loop)** incremental model:
 - [x] #5 — OpenAI streaming LLM provider
 - [x] #6 — ElevenLabs streaming TTS provider
 - [x] #7 — Async speaker output (`sounddevice`)
-- [ ] #8 — Wire all pipeline stages together
+- [x] #8 — Wire all pipeline stages together
 - [ ] #9 — End-to-end smoke test
 
 
