@@ -85,6 +85,7 @@ class Settings:
     # --- Audio settings ---
     audio_sample_rate: int = 16000   # Hz — must match the STT model's expected rate
     audio_chunk_size: int = 1024     # Frames per mic capture callback
+    tts_sample_rate: int = 24000     # Hz — must match ElevenLabsTTS output_format
 
     def __post_init__(self) -> None:
         """Validate field values immediately after the object is created."""
@@ -114,4 +115,5 @@ class Settings:
             tts_voice_id=os.getenv("TTS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM"),
             audio_sample_rate=_get_int("AUDIO_SAMPLE_RATE", 16000),
             audio_chunk_size=_get_int("AUDIO_CHUNK_SIZE", 1024),
+            tts_sample_rate=_get_int("TTS_SAMPLE_RATE", 24000),
         )

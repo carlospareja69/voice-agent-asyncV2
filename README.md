@@ -103,6 +103,7 @@ python main.py
 | `WHISPER_MODEL` | No | `base` | Whisper model size (`tiny`, `base`, `small`, …) |
 | `LLM_MODEL` | No | `gpt-4o-mini` | OpenAI model name |
 | `TTS_VOICE_ID` | No | `21m00Tcm4TlvDq8ikWAM` | ElevenLabs voice ID |
+| `TTS_SAMPLE_RATE` | No | `24000` | TTS output sample rate in Hz — must match `ElevenLabsTTS output_format` |
 
 ---
 
@@ -112,7 +113,7 @@ python main.py
 |---|---|
 | `agent/pipeline.py` | Owns all queues, starts all stage tasks, handles shutdown |
 | `agent/audio/input.py` | Captures mic audio, pushes raw PCM bytes to `audio_queue` |
-| `agent/audio/output.py` | Reads from `tts_queue`, plays audio through the speaker |
+| `agent/audio/output.py` | Reads from `tts_queue`, plays audio through speaker via `sounddevice.OutputStream` |
 | `agent/stt/base.py` | `STTProvider` ABC — `async transcribe(audio) -> str` |
 | `agent/llm/base.py` | `LLMProvider` ABC — `def generate(messages) -> AsyncIterator[str]` |
 | `agent/tts/base.py` | `TTSProvider` ABC — `def synthesize(text) -> AsyncIterator[bytes]` |
@@ -187,7 +188,7 @@ This project follows a **HITL (Human-in-the-Loop)** incremental model:
 - [x] #4 — Whisper STT provider (`faster-whisper`)
 - [x] #5 — OpenAI streaming LLM provider
 - [x] #6 — ElevenLabs streaming TTS provider
-- [ ] #7 — Async speaker output (`sounddevice`)
+- [x] #7 — Async speaker output (`sounddevice`)
 - [ ] #8 — Wire all pipeline stages together
 - [ ] #9 — End-to-end smoke test
 

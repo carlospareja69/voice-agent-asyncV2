@@ -1,4 +1,4 @@
-# Sprint Handoff — Post Issue #6
+# Sprint Handoff — Post Issue #7
 
 ---
 
@@ -12,6 +12,7 @@
 | #4 | Whisper STT provider | ✅ Done |
 | #5 | OpenAI streaming LLM provider | ✅ Done |
 | #6 | ElevenLabs streaming TTS provider | ✅ Done |
+| #7 | Async speaker output (sounddevice) | ✅ Done |
 
 ---
 
@@ -19,25 +20,27 @@
 
 | File | State |
 |---|---|
-| `config/settings.py` | ✅ Fully implemented |
+| `config/settings.py` | ✅ Fully implemented — `tts_sample_rate` added in Issue #7 |
 | `agent/context/manager.py` | ✅ Fully implemented |
 | `agent/stt/base.py` | ✅ ABC defined |
 | `agent/llm/base.py` | ✅ ABC corrected — `def generate` (not `async def`) |
 | `agent/tts/base.py` | ✅ ABC corrected — `def synthesize` (not `async def`) |
 | `agent/audio/input.py` | ✅ Fully implemented |
 | `agent/stt/whisper.py` | ✅ Fully implemented |
-| `agent/audio/output.py` | 🔶 Scaffold — `stream()` raises `NotImplementedError` |
+| `agent/audio/output.py` | ✅ Fully implemented in Issue #7 |
 | `agent/llm/openai.py` | ✅ Fully implemented |
 | `agent/tts/elevenlabs.py` | ✅ Fully implemented |
 | `agent/pipeline.py` | 🔶 Scaffold — all methods raise `NotImplementedError` |
-| `main.py` | ✅ Entry point wired — fails at runtime until Issue #8 |
-| `tests/test_settings.py` | ✅ 19 tests passing |
+| `main.py` | ✅ Entry point wired — `ElevenLabsTTS` now receives `output_format` from Settings |
+| `.env.example` | ✅ `TTS_SAMPLE_RATE` documented |
+| `tests/test_settings.py` | ✅ 22 tests passing |
 | `tests/test_audio_input.py` | ✅ 9 tests passing |
+| `tests/test_audio_output.py` | ✅ 9 tests passing (new in Issue #7) |
 | `tests/test_stt_whisper.py` | ✅ 13 tests passing |
 | `tests/test_llm_openai.py` | ✅ 13 tests passing |
 | `tests/test_tts_elevenlabs.py` | ✅ 23 tests passing |
 
-**Total test count: 77 — all passing.**
+**Total test count: 89 — all passing.**
 
 ---
 
@@ -65,6 +68,26 @@ Declaring `async def` on these methods was a type lie: the annotation claimed `A
 - `generate()` opens a streaming request (`stream=True`), yields non-None delta content tokens, and always closes the HTTP stream in a `try/finally` block.
 - Chunks with empty `choices` lists (keep-alive frames) and `None` delta content (role-metadata frames) are silently skipped — both are normal SSE protocol frames.
 - `stream = await client.chat.completions.create(...)` is placed **outside** the `try` block deliberately. There is no suspension point between the `await` returning and `try:` being entered, so `CancelledError` cannot arrive in that gap. The `finally` runs if and only if `stream` was successfully assigned.
+
+### SpeakerOutput implementation contract (established by Issue #7)
+
+- `SpeakerOutput(sample_rate=24000)` opens a `sounddevice.OutputStream` with `dtype="int16"`, `channels=1`, `samplerate=self.sample_rate`.
+- `stream(queue)` is an `async` coroutine — not an async generator. It runs a `while True` loop consuming from the asyncio `tts_queue`. Cancelled via `asyncio.CancelledError` which is logged and re-raised.
+- **Two-layer buffer pattern** is the canonical bridge between asyncio and PortAudio:
+  1. The asyncio task reads `bytes` from `tts_queue` (`asyncio.Queue`) and puts them into `_buffer` (`queue.Queue` — stdlib, thread-safe).
+  2. The PortAudio output callback reads from `_buffer` using `get_nowait()` — non-blocking, never suspends the audio thread.
+- **`bytearray` leftover accumulator** handles chunk/frame misalignment. TTS chunks (~4096 bytes) do not align with PortAudio frame requests (256–2048 frames × 2 bytes). `leftover` holds unconsumed bytes between callbacks and is filled first before `outdata` is written.
+- **Silence fill**: if `available_frames < frames` (not enough audio data), the remaining slots are set to 0 — this prevents audio glitches and is the correct behavior when TTS is slow.
+- `_buffer` and `leftover` are local to `stream()`. The callback is a closure over both — this means they cannot be inspected from outside, but the closure is valid because the callback's lifetime is bounded by the `with sounddevice.OutputStream(...)` block.
+- **No executor needed**: unlike Whisper, the asyncio task is just copying references between queues — zero CPU-bound work. `run_in_executor` is not appropriate here.
+
+### `Settings.tts_sample_rate` contract (established by Issue #7)
+
+- `Settings.tts_sample_rate: int = 24000` is the single authoritative source for the TTS audio sample rate.
+- `main.py` constructs `ElevenLabsTTS(..., output_format=f"pcm_{settings.tts_sample_rate}")` — the format string ensures they are always consistent.
+- `SpeakerOutput(sample_rate=...)` is wired from `Settings` inside `pipeline.py`. That wiring is deferred to Issue #8 (cannot touch `pipeline.py` yet — scaffold has `SpeakerOutput()` with no args, using the default 24000 Hz).
+- `TTS_SAMPLE_RATE` env var overrides the default. Validation is intentionally minimal (positive integer check only) — no allowlist of valid sample rates. Add `VALID_TTS_SAMPLE_RATES` validation if/when a non-24000 value is observed in practice.
+- The duplicate-defaults maintenance trap identified in Issue #6 QA is **partially resolved**: `ElevenLabsTTS` now gets its format from Settings. Full resolution (wiring `SpeakerOutput` through Settings) completes in Issue #8.
 
 ### ElevenLabsTTS implementation contract (established by Issue #6)
 
@@ -160,13 +183,22 @@ asyncio.run(pipeline.run()) # async — event loop starts here
 | Post-cancellation callback fires in the shutdown window | Benign — InputStream `__exit__` is synchronous and stops PortAudio before `asyncio.run()` unwinds. At most one extra chunk in the queue. |
 | `logging` call inside audio callback acquires a lock on audio thread | Correct per Python logging docs; only fires on abnormal status events — not on every chunk |
 
+### Issue #7 — Accepted risks
+
+| Risk | Reason accepted |
+|---|---|
+| `SpeakerOutput` in `pipeline.py` uses `SpeakerOutput()` with no args (default 24000 Hz) — not wired through `settings.tts_sample_rate` | `pipeline.py` is the Issue #8 target. The default is correct for the current configuration. Wiring deferred to Issue #8. |
+| PortAudio callback fires on shutdown before `OutputStream.__exit__` runs | Benign — at most one extra audio glitch during teardown. `OutputStream.__exit__` is synchronous and stops PortAudio before `asyncio.run()` unwinds. |
+| `queue.Queue` (`_buffer`) can grow unbounded if the asyncio task produces faster than PortAudio consumes | This cannot happen in practice: PortAudio runs in real time and ElevenLabs is network-bound. No back-pressure needed at this layer. |
+| No validation that `TTS_SAMPLE_RATE` is a known ElevenLabs value | Intentionally deferred. Add `VALID_TTS_SAMPLE_RATES` allowlist when a non-24000 value is needed. |
+
 ### Issue #6 — Accepted risks
 
 | Risk | Reason accepted |
 |---|---|
 | `voice_settings` (`stability`, `similarity_boost`) hardcoded in the request payload | Configurable in the ElevenLabs API but not needed for this project. Promote to constructor parameters when voice-quality tuning becomes a requirement. |
 | Session-per-request discards TCP connection pooling | Acceptable for a sequential voice-agent pipeline making one TTS call at a time. If concurrent TTS calls were ever added, replace with a persistent shared session. |
-| `output_format` mismatch between `ElevenLabsTTS` and `SpeakerOutput` is not caught at startup | Both are plain constructor parameters with no cross-validation. If they diverge, the speaker plays noise or crashes. Mitigation: wire both through `Settings.tts_sample_rate` (deferred to Issue #7). |
+| ~~`output_format` mismatch between `ElevenLabsTTS` and `SpeakerOutput` is not caught at startup~~ | ✅ Partially resolved in Issue #7 — `ElevenLabsTTS` now derives `output_format` from `settings.tts_sample_rate`. Full resolution (wiring `SpeakerOutput` too) in Issue #8. |
 | `model_id="eleven_monolingual_v1"` may produce suboptimal results for non-English text | Known limitation of the default model. Pass `model_id="eleven_multilingual_v2"` at construction for multilingual use. |
 
 ### Issue #5 — Accepted risks
@@ -269,13 +301,11 @@ Fix before Issue #8 (where the STT stage loop is written and the call is embedde
 
 **Address when implementing Issue #5 (OpenAI LLM).**
 
-### 🟠 Medium — duplicate defaults maintenance trap
+### 🟡 Medium — `SpeakerOutput` not yet wired through `Settings.tts_sample_rate`
 
-`MicrophoneInput.__init__` has `sample_rate=16000, chunk_size=1024` as defaults.
-`Settings` also has `audio_sample_rate=16000, audio_chunk_size=1024` as defaults.
-`SpeakerOutput.__init__` hardcodes `sample_rate=24000` (not from Settings at all).
+`pipeline.py` constructs `SpeakerOutput()` with no arguments, using the default `sample_rate=24000`. It does not yet read from `settings.tts_sample_rate`. Changing `TTS_SAMPLE_RATE` in the env will update `ElevenLabsTTS` (wired in `main.py` in Issue #7) but not `SpeakerOutput` (wired in `pipeline.py` in Issue #8). Until Issue #8, keep `TTS_SAMPLE_RATE` at its default 24000.
 
-Fix both audio modules in a single pass when implementing Issue #7.
+**Fix in Issue #8** — update `pipeline.py` to pass `sample_rate=settings.tts_sample_rate` to `SpeakerOutput(...)`. This completes the duplicate-defaults resolution started in Issue #7.
 
 ---
 
@@ -283,11 +313,10 @@ Fix both audio modules in a single pass when implementing Issue #7.
 
 | # | Title | Depends on | Key file |
 |---|---|---|---|
-| #7 | Async speaker output | — | `agent/audio/output.py` |
-| #8 | Wire all pipeline stages | #5 ✅, #6 ✅, #7 | `agent/pipeline.py` |
+| #8 | Wire all pipeline stages | #5 ✅, #6 ✅, #7 ✅ | `agent/pipeline.py` |
 | #9 | End-to-end smoke test | #8 | manual + `tests/` |
 
-Issue #7 is the only remaining blocker before Issue #8.
+All individual component issues are complete. Issue #8 is now unblocked.
 
 ---
 
@@ -308,44 +337,52 @@ Issue #7 is the only remaining blocker before Issue #8.
 | `CancelledError` unit test for `generate()` | Issue #9 — live-cancellation path covered by end-to-end smoke test |
 | `stream.close()` exception masking in `finally` | Fix only if observed — add `contextlib.suppress(Exception)` around close call |
 | `voice_settings` hardcoded in `ElevenLabsTTS` | Promote to constructor parameters when voice-quality tuning is needed |
-| `output_format` / `SpeakerOutput.sample_rate` not cross-validated at startup | Wire both through `Settings.tts_sample_rate` in Issue #7 |
+| ~~`output_format` / `SpeakerOutput.sample_rate` not cross-validated at startup~~ | ✅ Partially resolved — `ElevenLabsTTS` wired through `Settings.tts_sample_rate` in Issue #7. `SpeakerOutput` wiring deferred to Issue #8. |
 
 ---
 
 ## Recommended Next Issue
 
-**→ Issue #7: Async speaker output** (`agent/audio/output.py`) — the only remaining blocker before Issue #8.
+**→ Issue #8: Wire all pipeline stages** (`agent/pipeline.py`) — all components are complete and individually tested.
 
-Issue #7 completes the full audio frame: input ✅ → STT ✅ → LLM ✅ → TTS ✅ → speaker 🔶.
+Full audio frame: input ✅ → STT ✅ → LLM ✅ → TTS ✅ → speaker ✅.
 
-**Key implementation notes for Issue #7:**
+**Key implementation notes for Issue #8:**
 
-**Audio format input:**
-`SpeakerOutput` reads from `tts_queue`, which carries raw int16 PCM bytes at 24 kHz mono (established by Issue #6). Configure `sounddevice.OutputStream` with:
-- `dtype="int16"`
-- `samplerate=24000`
-- `channels=1`
+**Stage topology:**
+```
+MicrophoneInput
+    ↓  audio_queue  (bytes, float32, 16 kHz, mono)
+  STT stage         — accumulate chunks → WhisperSTT.transcribe() → text
+    ↓  text_queue   (str)
+  LLM stage         — ContextManager.add_turn() → OpenAILLM.generate() → sentence assembler
+    ↓  token_queue  (str)
+  [sentence assembler] → sentence_queue (str)  [new asyncio.Task]
+    ↓  sentence queue or directly to TTS
+  TTS stage         — ElevenLabsTTS.synthesize() → audio chunks
+    ↓  tts_queue    (bytes, int16, 24 kHz, mono)
+SpeakerOutput
+```
 
-Fix `sample_rate=24000` hardcoding in the scaffold — add `Settings.tts_sample_rate` (or rename the existing `audio_sample_rate` convention). Both `ElevenLabsTTS(output_format="pcm_24000")` and `SpeakerOutput(sample_rate=24000)` must be wired through the same `Settings` field. This resolves the duplicate-defaults maintenance trap flagged in the pre-#5 architectural review.
+**Critical: sentence assembler between LLM and TTS.**
+`token_queue` carries individual LLM tokens. `ElevenLabsTTS.synthesize()` expects full sentences for natural prosody. Issue #8 must implement a sentence assembler — either as a dedicated task or inline in the TTS stage. The simplest approach: buffer tokens until a sentence-ending punctuation character (`.`, `!`, `?`) is encountered, then enqueue the accumulated sentence.
 
-**Threading model — the critical inversion from Issue #3:**
-`MicrophoneInput` pushed bytes onto an `asyncio.Queue` from a PortAudio callback thread (using `call_soon_threadsafe`). `SpeakerOutput` is the inverse: it must *pull* bytes from the queue and write them to the device. The PortAudio output callback runs on a real-time audio thread under a hard deadline — it cannot `await` anything.
+**Critical: async generator cleanup in LLM and TTS stages.**
+Both `_llm_stage` and `_tts_stage` must hold a reference to their active generator and call `await gen.aclose()` before re-raising `CancelledError`. This is a hard requirement — see the detailed pattern under "Known Architectural Risks → Critical for Issue #8".
 
-**Required pattern**: use a `queue.Queue` (stdlib, thread-safe) as an internal buffer between the asyncio event loop and the PortAudio callback:
-1. The asyncio task (`stream()` coroutine) reads from `tts_queue` (`asyncio.Queue[bytes]`) and puts items into a `queue.Queue[bytes]` (thread-safe)
-2. The PortAudio output callback reads from the `queue.Queue` using `get_nowait()` — no blocking, no asyncio
-3. If the `queue.Queue` is empty, the callback writes silence (zeros) to avoid audio glitches
+**Settings wiring:**
+`SpeakerOutput(sample_rate=settings.tts_sample_rate)` — the scaffold uses `SpeakerOutput()` (default 24000 Hz). Update it in Issue #8 to pass `settings.tts_sample_rate`. This is the last step completing the duplicate-defaults resolution.
 
-**Cancellation:**
-Same pattern as Issue #3 — catch `CancelledError` inside `stream()`, close the `OutputStream`, re-raise.
+**`ElevenLabsTTS` has no `close()` method.** Issue #8 does not call `tts.close()` at shutdown.
 
-**No executor needed:**
-Unlike Issue #4 (Whisper), sounddevice output callbacks are not CPU-bound. The asyncio task just drains the `tts_queue` and feeds the internal buffer. No `run_in_executor` required.
+**`ContextManager` cleanup (deferred technical debt):**
+Address role validation and unbounded growth in the same pass: add `Message` TypedDict, validate role as `"user"` or `"assistant"` only, optionally add a sliding window.
 
-**Issue #8 notes (for reference when both #7 is done):**
-- `ElevenLabsTTS` has no `close()` method — Issue #8 does not call `tts.close()`
-- TTS stage must call `await gen.aclose()` before re-raising `CancelledError` (same rule as LLM stage)
-- Sentence assembler between `token_queue` and TTS must be designed in Issue #8 — `synthesize()` takes full sentences, not individual tokens
+**Chunk accumulation for STT:**
+The STT stage must accumulate enough audio before calling `transcribe()`. 1024-frame chunks at 16 kHz = 64 ms — too short for accurate transcription. Accumulate at least 1–2 seconds (16 000–32 000 frames) before each call.
+
+**Queue sizing:**
+Consider `asyncio.Queue(maxsize=N)` to add back-pressure. Design the maxsize together with the `QueueFull` error handling strategy.
 
 ---
 
@@ -366,5 +403,7 @@ Unlike Issue #4 (Whisper), sounddevice output callbacks are not CPU-bound. The a
 7. **`WhisperSTT.sample_rate` is stored but unused.** Do not pass values other than 16000 — they produce no error but degrade transcription quality silently.
 
 8. **Chunk accumulation is a pipeline responsibility (Issue #8).** `WhisperSTT.transcribe()` accepts any-length bytes, but 64 ms chunks (1024 frames at 16 kHz) produce poor results. The STT stage loop must accumulate enough audio before calling `transcribe()`.
+
+10. **`SpeakerOutput` in `pipeline.py` is not yet wired to `Settings.tts_sample_rate`.** It uses the default 24000 Hz. Do not change `TTS_SAMPLE_RATE` in the env until Issue #8 completes the wiring — `ElevenLabsTTS` would change format but `SpeakerOutput` would not, producing garbled audio.
 
 9. **Both `_llm_stage` and `_tts_stage` in Issue #8 must call `await gen.aclose()` before re-raising `CancelledError`.** This applies to every async generator in the pipeline. The context managers inside `synthesize()` and the `try/finally` inside `generate()` do not run automatically when `async for` is abandoned — both require explicit `aclose()` from their stage.

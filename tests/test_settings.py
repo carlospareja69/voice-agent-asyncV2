@@ -89,6 +89,12 @@ class TestSettings:
         assert s.whisper_model == "base"
         assert s.audio_sample_rate == 16000
         assert s.audio_chunk_size == 1024
+        assert s.tts_sample_rate == 24000
+
+    def test_tts_sample_rate_default(self):
+        """Default tts_sample_rate is 24000 Hz — matches pcm_24000 from ElevenLabs."""
+        s = _make_settings()
+        assert s.tts_sample_rate == 24000
 
     def test_api_keys_hidden_in_repr(self):
         s = _make_settings()
@@ -128,13 +134,14 @@ class TestFromEnv:
         monkeypatch.setenv("ELEVENLABS_API_KEY", "el-real")
         # Unset optionals so defaults are used
         for key in ("WHISPER_MODEL", "LLM_MODEL", "TTS_VOICE_ID",
-                    "AUDIO_SAMPLE_RATE", "AUDIO_CHUNK_SIZE"):
+                    "AUDIO_SAMPLE_RATE", "AUDIO_CHUNK_SIZE", "TTS_SAMPLE_RATE"):
             monkeypatch.delenv(key, raising=False)
 
         s = Settings.from_env()
         assert s.llm_model == "gpt-4o-mini"
         assert s.whisper_model == "base"
         assert s.audio_sample_rate == 16000
+        assert s.tts_sample_rate == 24000
 
     def test_raises_without_openai_key(self, monkeypatch):
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
@@ -163,4 +170,24 @@ class TestFromEnv:
         monkeypatch.setenv("ELEVENLABS_API_KEY", "el-real")
         monkeypatch.setenv("AUDIO_SAMPLE_RATE", "not-a-number")
         with pytest.raises(ValueError, match="AUDIO_SAMPLE_RATE"):
+            Settings.from_env()
+
+    def test_overrides_tts_sample_rate_from_env(self, monkeypatch):
+        """TTS_SAMPLE_RATE env var overrides the 24000 default."""
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-real")
+        monkeypatch.setenv("ELEVENLABS_API_KEY", "el-real")
+        monkeypatch.setenv("TTS_SAMPLE_RATE", "44100")
+        for key in ("WHISPER_MODEL", "LLM_MODEL", "TTS_VOICE_ID",
+                    "AUDIO_SAMPLE_RATE", "AUDIO_CHUNK_SIZE"):
+            monkeypatch.delenv(key, raising=False)
+
+        s = Settings.from_env()
+        assert s.tts_sample_rate == 44100
+
+    def test_raises_on_bad_tts_sample_rate(self, monkeypatch):
+        """A non-integer TTS_SAMPLE_RATE raises a clear ValueError."""
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-real")
+        monkeypatch.setenv("ELEVENLABS_API_KEY", "el-real")
+        monkeypatch.setenv("TTS_SAMPLE_RATE", "abc")
+        with pytest.raises(ValueError, match="TTS_SAMPLE_RATE"):
             Settings.from_env()
