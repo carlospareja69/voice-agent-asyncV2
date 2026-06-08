@@ -114,10 +114,57 @@ python main.py
 | `agent/audio/input.py` | Captures mic audio, pushes raw PCM bytes to `audio_queue` |
 | `agent/audio/output.py` | Reads from `tts_queue`, plays audio through the speaker |
 | `agent/stt/base.py` | `STTProvider` ABC — `async transcribe(audio) -> str` |
-| `agent/llm/base.py` | `LLMProvider` ABC — `async generate(messages) -> AsyncIterator[str]` |
-| `agent/tts/base.py` | `TTSProvider` ABC — `async synthesize(text) -> AsyncIterator[bytes]` |
+| `agent/llm/base.py` | `LLMProvider` ABC — `def generate(messages) -> AsyncIterator[str]` |
+| `agent/tts/base.py` | `TTSProvider` ABC — `def synthesize(text) -> AsyncIterator[bytes]` |
 | `agent/context/manager.py` | Stores message history, prepends system prompt for each LLM call |
 | `config/settings.py` | Loads and validates all env vars at startup |
+
+---
+
+## Audio Format Contracts
+
+Two queue format contracts have been established and must not be changed without updating both producer and consumer in the same commit.
+
+**`audio_queue` — microphone → STT**
+- Encoding: `float32`, little-endian
+- Sample rate: 16 000 Hz
+- Channels: 1 (mono)
+- Producer: `MicrophoneInput` / Consumer: `WhisperSTT`
+- Reconstruct: `np.frombuffer(chunk, dtype=np.float32)`
+
+**`tts_queue` — TTS → speaker**
+- Encoding: signed `int16`, little-endian
+- Sample rate: 24 000 Hz
+- Channels: 1 (mono)
+- Producer: `ElevenLabsTTS` / Consumer: `SpeakerOutput`
+- Reconstruct: `np.frombuffer(chunk, dtype=np.int16)`
+
+---
+
+## Streaming Provider Pattern
+
+`LLMProvider.generate()` and `TTSProvider.synthesize()` are **async generators** — calling them returns an `AsyncIterator` directly. Do **not** `await` the call.
+
+```python
+# Correct
+async for token in llm.generate(messages):
+    ...
+
+async for chunk in tts.synthesize(text):
+    ...
+```
+
+When consuming these in a pipeline stage, hold a reference to the generator and call `await gen.aclose()` before re-raising `CancelledError` to ensure HTTP connections are released promptly:
+
+```python
+gen = llm.generate(messages)
+try:
+    async for token in gen:
+        await queue.put(token)
+except asyncio.CancelledError:
+    await gen.aclose()
+    raise
+```
 
 ---
 
@@ -138,8 +185,8 @@ This project follows a **HITL (Human-in-the-Loop)** incremental model:
 - [x] #2 — Settings module with env validation
 - [x] #3 — Async microphone input (`sounddevice`)
 - [x] #4 — Whisper STT provider (`faster-whisper`)
-- [ ] #5 — OpenAI streaming LLM provider
-- [ ] #6 — ElevenLabs streaming TTS provider
+- [x] #5 — OpenAI streaming LLM provider
+- [x] #6 — ElevenLabs streaming TTS provider
 - [ ] #7 — Async speaker output (`sounddevice`)
 - [ ] #8 — Wire all pipeline stages together
 - [ ] #9 — End-to-end smoke test

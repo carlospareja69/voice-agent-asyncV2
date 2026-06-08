@@ -1,4 +1,4 @@
-# Sprint Handoff — Post Issue #5
+# Sprint Handoff — Post Issue #6
 
 ---
 
@@ -11,6 +11,7 @@
 | #3 | Async microphone input with sounddevice | ✅ Done |
 | #4 | Whisper STT provider | ✅ Done |
 | #5 | OpenAI streaming LLM provider | ✅ Done |
+| #6 | ElevenLabs streaming TTS provider | ✅ Done |
 
 ---
 
@@ -27,15 +28,16 @@
 | `agent/stt/whisper.py` | ✅ Fully implemented |
 | `agent/audio/output.py` | 🔶 Scaffold — `stream()` raises `NotImplementedError` |
 | `agent/llm/openai.py` | ✅ Fully implemented |
-| `agent/tts/elevenlabs.py` | 🔶 Scaffold — `synthesize()` raises `NotImplementedError` |
+| `agent/tts/elevenlabs.py` | ✅ Fully implemented |
 | `agent/pipeline.py` | 🔶 Scaffold — all methods raise `NotImplementedError` |
 | `main.py` | ✅ Entry point wired — fails at runtime until Issue #8 |
 | `tests/test_settings.py` | ✅ 19 tests passing |
 | `tests/test_audio_input.py` | ✅ 9 tests passing |
 | `tests/test_stt_whisper.py` | ✅ 13 tests passing |
 | `tests/test_llm_openai.py` | ✅ 13 tests passing |
+| `tests/test_tts_elevenlabs.py` | ✅ 23 tests passing |
 
-**Total test count: 54 — all passing.**
+**Total test count: 77 — all passing.**
 
 ---
 
@@ -63,6 +65,33 @@ Declaring `async def` on these methods was a type lie: the annotation claimed `A
 - `generate()` opens a streaming request (`stream=True`), yields non-None delta content tokens, and always closes the HTTP stream in a `try/finally` block.
 - Chunks with empty `choices` lists (keep-alive frames) and `None` delta content (role-metadata frames) are silently skipped — both are normal SSE protocol frames.
 - `stream = await client.chat.completions.create(...)` is placed **outside** the `try` block deliberately. There is no suspension point between the `await` returning and `try:` being entered, so `CancelledError` cannot arrive in that gap. The `finally` runs if and only if `stream` was successfully assigned.
+
+### ElevenLabsTTS implementation contract (established by Issue #6)
+
+- Session strategy: **Option C — session-per-request.** A new `aiohttp.ClientSession` is created inside each `synthesize()` call using `async with`. No persistent session state. No `close()` method on `ElevenLabsTTS`. **Issue #8 does NOT need to call `tts.close()` at shutdown.** This supersedes the pre-implementation recommendation in the earlier handoff.
+- `api_key` is stored as `self._api_key` (private). It is passed in the `xi-api-key` request header and never assigned to a public attribute. There is no `tts.api_key` — this is intentional.
+- `output_format` defaults to `"pcm_24000"`. Changing it changes the audio format of every byte yielded. The `SpeakerOutput` configuration in Issue #7 must match.
+- `voice_settings` (`stability=0.5`, `similarity_boost=0.75`) are hardcoded constants. Not constructor parameters. Accepted technical debt — promote when needed.
+- `response.raise_for_status()` is **synchronous** in aiohttp. It must not be `await`-ed. It is called immediately after the response is received, before any iteration begins.
+- Empty byte fragments from `iter_chunked()` are discarded silently. Empty chunks are a normal aiohttp delivery artefact on chunked transfer encoding boundaries.
+
+### `tts_queue` audio format contract (established by Issue #6)
+
+This is the authoritative description of items stored in `tts_queue`. It is the direct parallel of the `audio_queue` format contract established in Issue #3.
+
+```
+Encoding    : signed 16-bit integer (int16), little-endian
+Sample rate : 24 000 Hz
+Channels    : 1 (mono)
+```
+
+Every `bytes` object yielded by `ElevenLabsTTS.synthesize()` (with default `output_format="pcm_24000"`) is a fragment of this stream. Downstream consumers reconstruct with:
+
+```python
+np.frombuffer(chunk, dtype=np.int16)
+```
+
+**Changing `output_format` on `ElevenLabsTTS` invalidates this contract.** Both the constructor call and the `SpeakerOutput` configuration must be updated together in the same commit. Issue #7 must configure its `sounddevice.OutputStream` with `dtype="int16"`, `samplerate=24000`, `channels=1`.
 
 ### Async generator finalization contract (established by Issue #5)
 
@@ -131,6 +160,15 @@ asyncio.run(pipeline.run()) # async — event loop starts here
 | Post-cancellation callback fires in the shutdown window | Benign — InputStream `__exit__` is synchronous and stops PortAudio before `asyncio.run()` unwinds. At most one extra chunk in the queue. |
 | `logging` call inside audio callback acquires a lock on audio thread | Correct per Python logging docs; only fires on abnormal status events — not on every chunk |
 
+### Issue #6 — Accepted risks
+
+| Risk | Reason accepted |
+|---|---|
+| `voice_settings` (`stability`, `similarity_boost`) hardcoded in the request payload | Configurable in the ElevenLabs API but not needed for this project. Promote to constructor parameters when voice-quality tuning becomes a requirement. |
+| Session-per-request discards TCP connection pooling | Acceptable for a sequential voice-agent pipeline making one TTS call at a time. If concurrent TTS calls were ever added, replace with a persistent shared session. |
+| `output_format` mismatch between `ElevenLabsTTS` and `SpeakerOutput` is not caught at startup | Both are plain constructor parameters with no cross-validation. If they diverge, the speaker plays noise or crashes. Mitigation: wire both through `Settings.tts_sample_rate` (deferred to Issue #7). |
+| `model_id="eleven_monolingual_v1"` may produce suboptimal results for non-English text | Known limitation of the default model. Pass `model_id="eleven_multilingual_v2"` at construction for multilingual use. |
+
 ### Issue #5 — Accepted risks
 
 | Risk | Reason accepted |
@@ -189,6 +227,21 @@ async def _llm_stage(self) -> None:
 
 **This is a hard requirement. Omitting it is not a latent bug for a single-conversation agent (the event loop finalizer catches it at shutdown), but it becomes a connection pool leak in any service that restarts the pipeline without restarting the process.**
 
+The same requirement applies to `_tts_stage` and `ElevenLabsTTS.synthesize()`:
+
+```python
+async def _tts_stage(self) -> None:
+    while True:
+        sentence = await self.sentence_queue.get()  # assembled sentence (Issue #8)
+        gen = self.tts.synthesize(sentence)
+        try:
+            async for audio_chunk in gen:
+                await self.tts_queue.put(audio_chunk)
+        except asyncio.CancelledError:
+            await gen.aclose()   # ← REQUIRED — exits the aiohttp context managers
+            raise
+```
+
 ### 🟡 High — design decision required before Issue #8
 
 **Missing sentence assembler stage between LLM and TTS.**
@@ -230,13 +283,11 @@ Fix both audio modules in a single pass when implementing Issue #7.
 
 | # | Title | Depends on | Key file |
 |---|---|---|---|
-| #6 | ElevenLabs streaming TTS provider | — (ABC already fixed) | `agent/tts/elevenlabs.py` |
 | #7 | Async speaker output | — | `agent/audio/output.py` |
-| #8 | Wire all pipeline stages | #5 ✅, #6, #7 | `agent/pipeline.py` |
+| #8 | Wire all pipeline stages | #5 ✅, #6 ✅, #7 | `agent/pipeline.py` |
 | #9 | End-to-end smoke test | #8 | manual + `tests/` |
 
-Issues #6 and #7 are independent of each other and can be implemented in either order.  
-Issue #8 requires both to be complete.
+Issue #7 is the only remaining blocker before Issue #8.
 
 ---
 
@@ -246,7 +297,7 @@ Issue #8 requires both to be complete.
 |---|---|
 | Voice Activity Detection (VAD) | After Issue #9 — silence hits STT producing empty strings that propagate to LLM |
 | `asyncio.Queue(maxsize=N)` back-pressure | Issue #8 hardening — must be designed together with `QueueFull` error handling |
-| `aiohttp.ClientSession` lifecycle in ElevenLabsTTS | Issues #6 (open) + #8 (close on shutdown) |
+| ~~`aiohttp.ClientSession` lifecycle in ElevenLabsTTS~~ | ✅ Resolved in Issue #6 — session-per-request, no close() needed |
 | `ContextManager` role validation and sliding window | Issue #8 |
 | `Message` TypedDict to replace `list[dict]` | Issue #8 — same pass as ContextManager fixes |
 | ~~`async def → def` fix on LLM and TTS ABCs~~ | ✅ Done in Issue #5 |
@@ -256,33 +307,45 @@ Issue #8 requires both to be complete.
 | Chunk accumulation before STT | Issue #8 — pipeline stage must collect enough audio before calling `transcribe()` |
 | `CancelledError` unit test for `generate()` | Issue #9 — live-cancellation path covered by end-to-end smoke test |
 | `stream.close()` exception masking in `finally` | Fix only if observed — add `contextlib.suppress(Exception)` around close call |
+| `voice_settings` hardcoded in `ElevenLabsTTS` | Promote to constructor parameters when voice-quality tuning is needed |
+| `output_format` / `SpeakerOutput.sample_rate` not cross-validated at startup | Wire both through `Settings.tts_sample_rate` in Issue #7 |
 
 ---
 
 ## Recommended Next Issue
 
-**→ Issue #6 and Issue #7 are both unblocked. Either can go first; #7 is recommended.**
+**→ Issue #7: Async speaker output** (`agent/audio/output.py`) — the only remaining blocker before Issue #8.
 
-**Why #7 before #6:**
-- No external API dependency — fully testable without any API key or network
-- Mirrors Issue #3 (microphone input) exactly: callback-based sounddevice, `call_soon_threadsafe`, `CancelledError` re-raise, executor-free
-- Completes the full audio frame (input ✅ → STT ✅ → ... → speaker 🔶) from the edges inward
-- After #7, Issue #6 can proceed with the complete audio path in place
+Issue #7 completes the full audio frame: input ✅ → STT ✅ → LLM ✅ → TTS ✅ → speaker 🔶.
 
-**Key implementation notes for Issue #7** (`agent/audio/output.py`):
+**Key implementation notes for Issue #7:**
 
-- `SpeakerOutput` is the inverse of `MicrophoneInput`: reads from a queue, writes to the device
-- Use `sounddevice.OutputStream` with a callback — callback runs on PortAudio's thread
-- ⚠️ **Critical design difference from Issue #3**: the audio thread must *pull* from the queue, not push to it. `asyncio.Queue` is not safe to read from a non-asyncio thread. Use a `queue.Queue` (stdlib, threading-safe) as an internal buffer between the asyncio task and the PortAudio callback — the asyncio task transfers bytes from `tts_queue` into the `queue.Queue`; the PortAudio callback reads from it under real-time deadline
-- Fix `sample_rate=24000` hardcoding — read from `Settings` or add a dedicated `Settings.tts_sample_rate` field. Do not leave it hardcoded; this is the duplicate-defaults maintenance trap identified in the pre-#5 architectural review
-- Re-raise `CancelledError` after closing the stream
+**Audio format input:**
+`SpeakerOutput` reads from `tts_queue`, which carries raw int16 PCM bytes at 24 kHz mono (established by Issue #6). Configure `sounddevice.OutputStream` with:
+- `dtype="int16"`
+- `samplerate=24000`
+- `channels=1`
 
-**Key implementation notes for Issue #6** (`agent/tts/elevenlabs.py`):
+Fix `sample_rate=24000` hardcoding in the scaffold — add `Settings.tts_sample_rate` (or rename the existing `audio_sample_rate` convention). Both `ElevenLabsTTS(output_format="pcm_24000")` and `SpeakerOutput(sample_rate=24000)` must be wired through the same `Settings` field. This resolves the duplicate-defaults maintenance trap flagged in the pre-#5 architectural review.
 
-- `TTSProvider.synthesize()` ABC is now correctly `def synthesize(self, text: str) -> AsyncIterator[bytes]` — implement as an async generator with `yield`
-- ElevenLabs streams audio bytes over HTTP — use `aiohttp.ClientSession` for the request
-- `aiohttp.ClientSession` lifecycle: open at construction (or lazily on first call), close in `pipeline.run()` shutdown. Issue #8 must call `await tts.close()` — design accordingly
-- `try/finally` pattern for the HTTP response body is the same as `OpenAILLM.generate()` — the same async generator finalization rules apply: Issue #8 must call `await gen.aclose()` on the TTS generator in the TTS stage's cancellation handler
+**Threading model — the critical inversion from Issue #3:**
+`MicrophoneInput` pushed bytes onto an `asyncio.Queue` from a PortAudio callback thread (using `call_soon_threadsafe`). `SpeakerOutput` is the inverse: it must *pull* bytes from the queue and write them to the device. The PortAudio output callback runs on a real-time audio thread under a hard deadline — it cannot `await` anything.
+
+**Required pattern**: use a `queue.Queue` (stdlib, thread-safe) as an internal buffer between the asyncio event loop and the PortAudio callback:
+1. The asyncio task (`stream()` coroutine) reads from `tts_queue` (`asyncio.Queue[bytes]`) and puts items into a `queue.Queue[bytes]` (thread-safe)
+2. The PortAudio output callback reads from the `queue.Queue` using `get_nowait()` — no blocking, no asyncio
+3. If the `queue.Queue` is empty, the callback writes silence (zeros) to avoid audio glitches
+
+**Cancellation:**
+Same pattern as Issue #3 — catch `CancelledError` inside `stream()`, close the `OutputStream`, re-raise.
+
+**No executor needed:**
+Unlike Issue #4 (Whisper), sounddevice output callbacks are not CPU-bound. The asyncio task just drains the `tts_queue` and feeds the internal buffer. No `run_in_executor` required.
+
+**Issue #8 notes (for reference when both #7 is done):**
+- `ElevenLabsTTS` has no `close()` method — Issue #8 does not call `tts.close()`
+- TTS stage must call `await gen.aclose()` before re-raising `CancelledError` (same rule as LLM stage)
+- Sentence assembler between `token_queue` and TTS must be designed in Issue #8 — `synthesize()` takes full sentences, not individual tokens
 
 ---
 
@@ -304,4 +367,4 @@ Issue #8 requires both to be complete.
 
 8. **Chunk accumulation is a pipeline responsibility (Issue #8).** `WhisperSTT.transcribe()` accepts any-length bytes, but 64 ms chunks (1024 frames at 16 kHz) produce poor results. The STT stage loop must accumulate enough audio before calling `transcribe()`.
 
-9. **The `_llm_stage` in Issue #8 must call `await gen.aclose()` before re-raising `CancelledError`.** See the Critical requirement above. The `try/finally` in `generate()` does not run automatically when `async for` is abandoned — it requires explicit `aclose()` from the stage.
+9. **Both `_llm_stage` and `_tts_stage` in Issue #8 must call `await gen.aclose()` before re-raising `CancelledError`.** This applies to every async generator in the pipeline. The context managers inside `synthesize()` and the `try/finally` inside `generate()` do not run automatically when `async for` is abandoned — both require explicit `aclose()` from their stage.
